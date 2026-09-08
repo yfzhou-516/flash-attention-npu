@@ -840,8 +840,7 @@ private:
             const uint64_t detSlot =
                 ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
                 (block.blockId % waveSize_);
-            auto dv = MakeGmTensor(dvDetWorkspaceGm_,
-                detSlot * dvDetSlotElems_,
+            auto dv = MakeGmTensor(dvDetWorkspaceGm_, detSlot * dvDetSlotElems_,
                 block.s2Extend, vHeadDim_, vHeadDimAlign_);
             mm345.ComputeDv(l1PTensor[slot], dy, dv,
                 Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend),
@@ -882,11 +881,9 @@ private:
             const uint64_t detSlot =
                 ((block.blockId / waveSize_) & 1ULL) * waveSize_ +
                 (block.blockId % waveSize_);
-            auto dq = MakeGmTensor(dqDetWorkspaceGm_,
-                detSlot * dqDetSlotElems_,
+            auto dq = MakeGmTensor(dqDetWorkspaceGm_, detSlot * dqDetSlotElems_,
                 block.s1Extend, qkHeadDim_, qkHeadDimAlign_);
-            auto dk = MakeGmTensor(dkDetWorkspaceGm_,
-                detSlot * dkDetSlotElems_,
+            auto dk = MakeGmTensor(dkDetWorkspaceGm_, detSlot * dkDetSlotElems_,
                 block.s2Extend, qkHeadDim_, qkHeadDimAlign_);
             mm345.ComputeDqDk(
                 l1dSTensor[slot], k, q, dq, dk,
