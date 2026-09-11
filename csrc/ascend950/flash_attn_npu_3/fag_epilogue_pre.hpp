@@ -49,8 +49,12 @@ public:
         const uint64_t dkCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->qkHeadDim;
         const uint64_t dvCount = static_cast<uint64_t>(tiling_->totalKv) * tiling_->kvHeadNum * tiling_->vHeadDim;
         ClearRegion(dqWorkspace_, dqCount, vectorCoreId, vectorCoreNum);
-        ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
-        ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+        // BN2S2 with per-core private dk/dv: the private regions' first write
+        // of a column overwrites stale data, so only dq is zeroed.
+        if (tiling_->detPrivDkv == 0) {
+            ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
+            ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
+        }
         if (vectorCoreId == 0) {
             // GM_ADDR is __gm__ uint8_t*: cast to int64_t to zero the FULL
             // counters, and use atomics so the zeroing is visible at L2 —

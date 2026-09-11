@@ -5,6 +5,7 @@
  */
 
 #include "fag_common.h"
+#include "fag_det_schedule_host.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +27,41 @@ uint64_t CeilDivU64(uint64_t value, uint64_t divisor)
     return (value + divisor - 1) / divisor;
 }
 
+// BN2S2 UB budget: the main pipeline owns two ping/pong halves and the dk/dv
+// cast owns a chunked tail region (mirrors the kernel Init formula).
+int64_t CheckBn2s2CastUb(const FAGTilingData &tiling, const FAGInfo &info)
+{
+    const uint64_t FP32_BYTES = sizeof(float);
+    const uint64_t rowsPerSub = RoundUpU64(tiling.qTile, 16) / 2;
+    const uint64_t mmResBytes = rowsPerSub * tiling.kvTile * FP32_BYTES;
+    const uint64_t attenMaskBytes = rowsPerSub * tiling.kvTile;
+    const uint64_t lseBytes = RoundUpU64(rowsPerSub, 8) * 8 * FP32_BYTES;
+    const uint64_t pBytes = (rowsPerSub + 1) * tiling.kvTile * 2;
+    const uint64_t deltaBytes = rowsPerSub * 8 * FP32_BYTES;
+    const uint64_t pOff = RoundUpU64(
+        RoundUpU64(2 * mmResBytes + attenMaskBytes, 32) + lseBytes, 32);
+    const uint64_t dSOff = RoundUpU64(pOff + pBytes, 32);
+    const uint64_t deltaOff = RoundUpU64(dSOff + pBytes, 32);
+    const uint64_t halfUb = RoundUpU64(deltaOff + deltaBytes, 32);
+    const uint64_t pipelineUb = 2 * halfUb;
+    const uint64_t chunkRows = tiling.kvTile < 32 ? tiling.kvTile : 32;
+    const uint64_t dAlign = RoundUpU64(info.qkHeadDim, FP32_ROW_ALIGN);
+    const uint64_t dvAlign = RoundUpU64(info.vHeadDim, FP32_ROW_ALIGN);
+    const uint64_t inCol = dAlign > dvAlign ? dAlign : dvAlign;
+    const uint64_t headCol =
+        info.qkHeadDim > info.vHeadDim ? info.qkHeadDim : info.vHeadDim;
+    const uint64_t castUb =
+        chunkRows * inCol * FP32_BYTES + chunkRows * headCol * 2;
+    if (pipelineUb + castUb > info.ubSize) {
+        fprintf(stderr,
+            "FAG950 det bn2s2: UB too small: pipeline %llu + cast %llu > %llu\n",
+            (unsigned long long)pipelineUb, (unsigned long long)castUb,
+            (unsigned long long)info.ubSize);
+        return -1;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
@@ -42,6 +78,8 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     tiling.layout = static_cast<uint32_t>(info.layout);
     tiling.maskType = static_cast<uint32_t>(info.maskType);
     tiling.deterministic = info.deterministic;
+    tiling.detSchedule =
+        info.deterministic ? info.detSchedule : static_cast<uint32_t>(DetSchedule::LEGACY);
     tiling.aicNum = info.aicNum;
     tiling.aivNum = info.aivNum;
     // tiling.
@@ -88,6 +126,226 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
         tiling.deltaOffset = tiling.dvOffset + dvWsSize;
         tiling.workspaceSize = tiling.deltaOffset + deltaWsSize;
         return 0;
+    }
+
+    // ------------------------------------------------------------------
+    // BN2S2 deterministic schedule (opst arch35 column-private accumulation).
+    // ------------------------------------------------------------------
+    if (tiling.detSchedule == static_cast<uint32_t>(DetSchedule::BN2S2)) {
+        if (info.layout == Layout::TND) {
+            // Ragged TND non-causal.  MHA uses the column-private swizzle
+            // (opst CalTNDDenseSwizzleIndex, per-batch round prefix); GQA uses
+            // opst's flat blocked partition (CalTNDDenseIndex !IS_N_EQUAL,
+            // cumulative-area prefix) with shared dk/dv workspaces because a
+            // column may straddle two lanes' slices.
+            if (info.maskType == MaskType::CAUSAL ||
+                info.batch + 1 > TND_SWIZZLE_PREFIX_NUM ||
+                info.actualSeqQ == nullptr || info.actualSeqKv == nullptr) {
+                fprintf(stderr,
+                    "FAG950 det bn2s2 tnd: unsupported TND shape (causal=%d B=%llu)\n",
+                    info.maskType == MaskType::CAUSAL ? 1 : 0,
+                    (unsigned long long)info.batch);
+                return -1;
+            }
+            const bool gqa = tiling.groupSize != 1;
+            if (!gqa && !fag_det_host::TndDenseSafe(
+                    static_cast<int64_t>(info.batch), info.actualSeqQ,
+                    info.actualSeqKv,
+                    static_cast<int64_t>(info.kvHeadNum),
+                    static_cast<int64_t>(info.aicNum), tiling.qTile,
+                    tiling.kvTile)) {
+                fprintf(stderr,
+                    "FAG950 det bn2s2 tnd: s1Outer < min(k, s2Outer) for some batch\n");
+                return -1;
+            }
+            int64_t prefix[TND_SWIZZLE_PREFIX_NUM] = {0};
+            int64_t maxRound = 0;
+            if (gqa) {
+                int64_t s1Max = 0;
+                int64_t s2Max = 0;
+                for (int64_t b = 0; b < static_cast<int64_t>(info.batch); ++b) {
+                    const int64_t s1Outer = (info.actualSeqQ[b] + tiling.qTile - 1) /
+                        tiling.qTile;
+                    const int64_t s2Outer = (info.actualSeqKv[b] + tiling.kvTile - 1) /
+                        tiling.kvTile;
+                    if (s1Outer <= 0 || s2Outer <= 0) {
+                        fprintf(stderr, "FAG950 det bn2s2 tnd: empty sequence\n");
+                        return -1;
+                    }
+                    prefix[b + 1] = prefix[b] + s1Outer * s2Outer;
+                    s1Max = s1Outer > s1Max ? s1Outer : s1Max;
+                    s2Max = s2Outer > s2Max ? s2Outer : s2Max;
+                }
+                const int64_t k = static_cast<int64_t>(info.aicNum);
+                const int64_t g = static_cast<int64_t>(tiling.groupSize);
+                const int64_t total = prefix[info.batch] *
+                    static_cast<int64_t>(info.kvHeadNum) * g;
+                maxRound = static_cast<int64_t>(
+                    std::max({CeilDivU64(total, k), static_cast<uint64_t>(s1Max * g),
+                              static_cast<uint64_t>(s2Max)}));
+            } else {
+                maxRound = fag_det_host::TndDensePrefix(
+                    static_cast<int64_t>(info.batch), info.actualSeqQ,
+                    info.actualSeqKv,
+                    static_cast<int64_t>(info.kvHeadNum), // g == 1
+                    static_cast<int64_t>(info.aicNum), tiling.qTile,
+                    tiling.kvTile, prefix);
+            }
+            if (maxRound <= 0) {
+                fprintf(stderr, "FAG950 det bn2s2 tnd: empty schedule\n");
+                return -1;
+            }
+            for (uint32_t b = 0; b <= info.batch && b < TND_SWIZZLE_PREFIX_NUM;
+                 ++b) {
+                tiling.tndPrefix[b] = prefix[b];
+            }
+            tiling.detKind = gqa ? fag_det_host::KIND_TND_GQA_DENSE
+                                 : fag_det_host::KIND_TND_DENSE;
+            tiling.detColumnRounds = 0;  // column end uses coordinate comparison
+            tiling.detBufNum = 1;
+            tiling.detPrivDkv = gqa ? 0U : 1U;
+            tiling.detMaxRound = static_cast<uint64_t>(maxRound);
+            tiling.dqPostAbsorb = 0;
+            tiling.continuousBlockNum = 1;
+            tiling.dqVecNum = 0;
+            tiling.dkVecNum = 0;
+            tiling.dvVecNum = 0;
+
+            const uint64_t dqWsSize =
+                tiling.totalQ * tiling.qHeadNum * dAlign * FP32_BYTES;
+            const uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
+            tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
+            if (gqa) {
+                // Shared dk/dv workspaces (same as the BSND GQA path).
+                const uint64_t dkWsSize = tiling.totalKv * tiling.kvHeadNum *
+                    dAlign * FP32_BYTES;
+                const uint64_t dvWsSize = tiling.totalKv * tiling.kvHeadNum *
+                    dvAlign * FP32_BYTES;
+                tiling.dkOffset =
+                    tiling.dqOffset + RoundUpU64(dqWsSize, GM_ALIGNMENT);
+                tiling.dvOffset =
+                    tiling.dkOffset + RoundUpU64(dkWsSize, GM_ALIGNMENT);
+                tiling.deltaOffset =
+                    tiling.dvOffset + RoundUpU64(dvWsSize, GM_ALIGNMENT);
+                tiling.workspaceSize =
+                    tiling.deltaOffset + RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+                tiling.dqDetOffset = 0;
+                tiling.dkDetOffset = 0;
+                tiling.dvDetOffset = 0;
+                tiling.dkPrivOffset = 0;
+                tiling.dvPrivOffset = 0;
+                return 0;
+            }
+            const uint64_t dkPrivSize = static_cast<uint64_t>(info.aicNum) *
+                tiling.kvTile * dAlign * FP32_BYTES;
+            const uint64_t dvPrivSize = static_cast<uint64_t>(info.aicNum) *
+                tiling.kvTile * dvAlign * FP32_BYTES;
+            tiling.deltaOffset =
+                tiling.dqOffset + RoundUpU64(dqWsSize, GM_ALIGNMENT);
+            tiling.dkPrivOffset =
+                tiling.deltaOffset + RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+            tiling.dvPrivOffset =
+                tiling.dkPrivOffset + RoundUpU64(dkPrivSize, GM_ALIGNMENT);
+            tiling.workspaceSize =
+                tiling.dvPrivOffset + RoundUpU64(dvPrivSize, GM_ALIGNMENT);
+            tiling.dkOffset = 0;
+            tiling.dvOffset = 0;
+            tiling.dqDetOffset = 0;
+            tiling.dkDetOffset = 0;
+            tiling.dvDetOffset = 0;
+            return CheckBn2s2CastUb(tiling, info);
+        }
+        if (info.layout != Layout::BSND) {
+            fprintf(stderr, "FAG950 det bn2s2: only BSND/TND are supported\n");
+            return -1;
+        }
+        const int64_t bh =
+            static_cast<int64_t>(info.batch) *
+            static_cast<int64_t>(info.kvHeadNum);
+        const int64_t m = (static_cast<int64_t>(info.qSeqlen) +
+                           static_cast<int64_t>(tiling.qTile) - 1) /
+            static_cast<int64_t>(tiling.qTile);
+        const int64_t n = (static_cast<int64_t>(info.kvSeqlen) +
+                           static_cast<int64_t>(tiling.kvTile) - 1) /
+            static_cast<int64_t>(tiling.kvTile);
+        const int64_t g = static_cast<int64_t>(tiling.groupSize);
+        const int64_t k = static_cast<int64_t>(info.aicNum);
+
+        const bool causal = info.maskType == MaskType::CAUSAL;
+        const fag_det_host::Selection sel =
+            fag_det_host::SelectSchedule(causal, bh, m, n, g, k);
+        if (!sel.supported) {
+            fprintf(stderr,
+                "FAG950 det bn2s2: no schedule for causal=%d B=%llu N2=%llu "
+                "m=%lld n=%lld g=%lld k=%d\n",
+                causal ? 1 : 0, (unsigned long long)info.batch,
+                (unsigned long long)info.kvHeadNum, (long long)m,
+                (long long)n, (long long)g, info.aicNum);
+            return -1;
+        }
+        tiling.detKind = sel.kind;
+        tiling.detColumnRounds = static_cast<uint32_t>(
+            fag_det_host::ScheduleColumnRounds(sel.kind, m, n));
+        tiling.detBufNum = fag_det_host::ScheduleBufNum(sel.kind);
+        // GQA shares one dk/dv column between the g query heads, so the
+        // per-core private buffer + early cast only applies to MHA (g == 1);
+        // GQA keeps the ordered atomic accumulation in the full workspaces.
+        tiling.detPrivDkv = (g == 1) ? 1U : 0U;
+        tiling.detMaxRound = static_cast<uint64_t>(
+            fag_det_host::ScheduleMaxRound(sel.kind, bh, m, n, g, k));
+        tiling.dqPostAbsorb = 0;
+        // One scheduled task per cube core per round; the paired AIVs are
+        // driven by the existing V1/V2 pipeline plus the per-column dk/dv
+        // cast, and the VecDTM group split is unused.
+        tiling.continuousBlockNum = 1;
+        tiling.dqVecNum = 0;
+        tiling.dkVecNum = 0;
+        tiling.dvVecNum = 0;
+
+        const uint64_t dqWsSize =
+            tiling.totalQ * tiling.qHeadNum * dAlign * FP32_BYTES;
+        const uint64_t deltaWsSize = tiling.totalQ * tiling.qHeadNum * 8;
+        if (!tiling.detPrivDkv) {
+            // Stage-1 layout (GQA): dq/dk/dv use the full fp32 workspaces.
+            const uint64_t dkWsSize =
+                tiling.totalKv * tiling.kvHeadNum * dAlign * FP32_BYTES;
+            const uint64_t dvWsSize =
+                tiling.totalKv * tiling.kvHeadNum * dvAlign * FP32_BYTES;
+            tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
+            tiling.dkOffset = tiling.dqOffset + RoundUpU64(dqWsSize, GM_ALIGNMENT);
+            tiling.dvOffset = tiling.dkOffset + RoundUpU64(dkWsSize, GM_ALIGNMENT);
+            tiling.deltaOffset = tiling.dvOffset + RoundUpU64(dvWsSize, GM_ALIGNMENT);
+            tiling.workspaceSize =
+                tiling.deltaOffset + RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+            tiling.dqDetOffset = 0;
+            tiling.dkDetOffset = 0;
+            tiling.dvDetOffset = 0;
+            tiling.dkPrivOffset = 0;
+            tiling.dvPrivOffset = 0;
+            return 0;
+        }
+
+        // Stage-2 layout (MHA): [sync 64KB][dq fp32 full][delta][dk priv][dv
+        // priv].  dq still uses the full fp32 workspace (ordered atomic
+        // accumulation); dk/dv accumulate in per-core private regions and are
+        // converted to the bf16 outputs as soon as a column completes.
+        const uint64_t dkPrivSize = static_cast<uint64_t>(info.aicNum) *
+            tiling.detBufNum * tiling.kvTile * dAlign * FP32_BYTES;
+        const uint64_t dvPrivSize = static_cast<uint64_t>(info.aicNum) *
+            tiling.detBufNum * tiling.kvTile * dvAlign * FP32_BYTES;
+
+        tiling.dqOffset = MULTI_CORE_SYNC_BYTES;
+        tiling.deltaOffset = tiling.dqOffset + RoundUpU64(dqWsSize, GM_ALIGNMENT);
+        tiling.dkPrivOffset = tiling.deltaOffset + RoundUpU64(deltaWsSize, GM_ALIGNMENT);
+        tiling.dvPrivOffset = tiling.dkPrivOffset + RoundUpU64(dkPrivSize, GM_ALIGNMENT);
+        tiling.workspaceSize = tiling.dvPrivOffset + RoundUpU64(dvPrivSize, GM_ALIGNMENT);
+        tiling.dkOffset = 0;
+        tiling.dvOffset = 0;
+        tiling.dqDetOffset = 0;
+        tiling.dkDetOffset = 0;
+        tiling.dvDetOffset = 0;
+
+        return CheckBn2s2CastUb(tiling, info);
     }
 
     // Deterministic layout:
