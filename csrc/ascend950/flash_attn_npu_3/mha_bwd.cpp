@@ -219,7 +219,10 @@ mha_bwd(
         // TND BN2S2: hand the per-batch lengths to the tiler, which
         // serializes the round/area prefix table.  MHA needs the swizzle's
         // intra-round uniqueness condition; GQA uses opst's flat partition.
-        if (deterministic && !is_causal &&
+        // Causal TND reuses the dense schedule with the causal mask applied
+        // in the epilogue (masked blocks contribute exact zeros), same as
+        // the rectangular BSND causal path.
+        if (deterministic &&
             batch_size + 1 <=
                 static_cast<int64_t>(FAGTiling950::TND_SWIZZLE_PREFIX_NUM) &&
             (num_heads != num_heads_kv ||

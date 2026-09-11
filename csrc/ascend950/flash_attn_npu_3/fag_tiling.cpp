@@ -133,17 +133,17 @@ int64_t GetFAGTilingParam(const FAGInfo &info, FAGTilingData &tiling)
     // ------------------------------------------------------------------
     if (tiling.detSchedule == static_cast<uint32_t>(DetSchedule::BN2S2)) {
         if (info.layout == Layout::TND) {
-            // Ragged TND non-causal.  MHA uses the column-private swizzle
-            // (opst CalTNDDenseSwizzleIndex, per-batch round prefix); GQA uses
+            // Ragged TND.  MHA uses the column-private swizzle (opst
+            // CalTNDDenseSwizzleIndex, per-batch round prefix); GQA uses
             // opst's flat blocked partition (CalTNDDenseIndex !IS_N_EQUAL,
             // cumulative-area prefix) with shared dk/dv workspaces because a
-            // column may straddle two lanes' slices.
-            if (info.maskType == MaskType::CAUSAL ||
-                info.batch + 1 > TND_SWIZZLE_PREFIX_NUM ||
+            // column may straddle two lanes' slices.  Causal reuses the same
+            // dense schedules with the causal mask (masked blocks add exact
+            // zeros), like the rectangular BSND causal path.
+            if (info.batch + 1 > TND_SWIZZLE_PREFIX_NUM ||
                 info.actualSeqQ == nullptr || info.actualSeqKv == nullptr) {
                 fprintf(stderr,
-                    "FAG950 det bn2s2 tnd: unsupported TND shape (causal=%d B=%llu)\n",
-                    info.maskType == MaskType::CAUSAL ? 1 : 0,
+                    "FAG950 det bn2s2 tnd: unsupported TND shape (B=%llu)\n",
                     (unsigned long long)info.batch);
                 return -1;
             }

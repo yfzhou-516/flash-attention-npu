@@ -664,11 +664,20 @@ private:
             }
             const uint32_t foldS2Start =
                 static_cast<uint32_t>(c.foldS2[p]) * kvBlockSize_;
-            // Fold buffers other than the task's own column only occur for
-            // BSND causal (uniform kv length), where the batch stride is
-            // kvSeqlen_.
-            const uint64_t foldKvStart =
-                static_cast<uint64_t>(c.foldBatch[p]) * kvSeqlen_;
+            // Packed row start of the fold column's batch: for TND it is the
+            // cumulative length (batches may differ), for BSND it is the
+            // uniform batch stride.  Fold buffers other than the task's own
+            // column (p == 1) only occur for the BSND causal zip.
+            uint64_t foldKvStart = 0;
+            if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+                foldKvStart = c.foldBatch[p] == 0
+                    ? 0
+                    : static_cast<uint64_t>(
+                        cuSeqKvPtr_[c.foldBatch[p] - 1]);
+            } else {
+                foldKvStart =
+                    static_cast<uint64_t>(c.foldBatch[p]) * kvSeqlen_;
+            }
             block.detFoldS2Start[p] = foldKvStart + foldS2Start;
             block.detFoldS2Extend[p] =
                 Min(kvBlockSize_, s2Len - foldS2Start);
